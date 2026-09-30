@@ -1,0 +1,7 @@
+{
+  "name": "andregames",
+  "integrations": {
+    "capacitor": {}
+  },
+  "type": "vue-vite"
+}
