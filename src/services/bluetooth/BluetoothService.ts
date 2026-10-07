@@ -1,6 +1,7 @@
 /// <reference types="cordova-plugin-bluetoothle" />
 import { Capacitor } from '@capacitor/core';
 import { Device } from '@capacitor/device';
+import { parseAdvertisement } from './advertisement';
 import { FrameAssembler, encodeFrames } from './frames';
 import type { BluetoothMessage, Player } from '@/types/game';
 
@@ -18,15 +19,29 @@ export interface NearbyRoom {
   players: Player[];
 }
 
-type PluginEvent = BluetoothlePlugin.InitializeResult & { name?: string; rssi?: number; localName?: string };
+type PluginEvent = Partial<BluetoothlePlugin.InitializeResult> & {
+  status?: BluetoothlePlugin.Status;
+  error?: string;
+  message?: string;
+  address?: string;
+  name?: string;
+  rssi?: number;
+  localName?: string;
+};
 type MessageHandler = (message: unknown, remoteAddress: string) => void;
 type ConnectionHandler = (connected: boolean, address: string) => void;
+interface PendingNotification {
+  resolve: () => void;
+  reject: (reason: Error) => void;
+  timeout: number;
+}
 
 class BluetoothService {
   private role: 'host' | 'guest' | null = null;
   private remoteAddress = '';
   private readonly peerAddresses = new Map<string, string>();
   private readonly connectedAddresses = new Set<string>();
+  private readonly notificationWaiters = new Map<string, PendingNotification[]>();
   private readonly assembler = new FrameAssembler();
   private onMessage: MessageHandler = () => undefined;
   private onConnection: ConnectionHandler = () => undefined;
@@ -122,6 +137,53 @@ class BluetoothService {
     if (message !== null) this.onMessage(message, address);
   }
 
+  private settleNotification(address: string, reason?: Error): void {
+    const queue = this.notificationWaiters.get(address);
+    const pending = queue?.shift();
+    if (!pending) return;
+    window.clearTimeout(pending.timeout);
+    if (!queue?.length) this.notificationWaiters.delete(address);
+    if (reason) pending.reject(reason);
+    else pending.resolve();
+  }
+
+  private notifyPeer(address: string, frame: Uint8Array): Promise<void> {
+    const bluetooth = this.plugin();
+    return new Promise((resolve, reject) => {
+      const pending: PendingNotification = {
+        resolve,
+        reject,
+        timeout: window.setTimeout(() => {
+          this.settleSpecificNotification(address, pending, new Error('O envio Bluetooth expirou. Confira se o convidado continua conectado.'));
+        }, 10000),
+      };
+      const queue = this.notificationWaiters.get(address) ?? [];
+      queue.push(pending);
+      this.notificationWaiters.set(address, queue);
+      bluetooth.notify(
+        () => undefined,
+        (error) => this.settleSpecificNotification(address, pending, new Error(error.message || 'Falha ao enviar pacote Bluetooth.')),
+        {
+          service: GAME_SERVICE_UUID,
+          characteristic: GAME_CHARACTERISTIC_UUID,
+          address,
+          value: this.base64(frame),
+        },
+      );
+    });
+  }
+
+  private settleSpecificNotification(address: string, pending: PendingNotification, reason?: Error): void {
+    const queue = this.notificationWaiters.get(address);
+    const index = queue?.indexOf(pending) ?? -1;
+    if (!queue || index < 0) return;
+    queue.splice(index, 1);
+    window.clearTimeout(pending.timeout);
+    if (!queue.length) this.notificationWaiters.delete(address);
+    if (reason) pending.reject(reason);
+    else pending.resolve();
+  }
+
   async startHost(
     room: { gameId: string; code: string; name: string; hostId: string; players: Player[] },
     onMessage: MessageHandler,
@@ -139,6 +201,13 @@ class BluetoothService {
     await new Promise<void>((resolve, reject) => {
       const timeout = window.setTimeout(() => reject(new Error('O servidor Bluetooth não inicializou. Feche e abra o app e tente novamente.')), 10000);
       bluetooth.initializePeripheral((event: PluginEvent) => {
+        if ((event.status === 'notificationSent' || event.error === 'notificationSent') && event.address) {
+          this.settleNotification(
+            event.address,
+            event.error ? new Error(event.message || 'O Android não conseguiu enviar a notificação BLE.') : undefined,
+          );
+          return;
+        }
         if (event.status === 'disabled') {
           onConnection(false, '');
           window.clearTimeout(timeout);
@@ -158,13 +227,13 @@ class BluetoothService {
           this.assembler.clearPeer(event.address);
           onConnection(false, event.address);
         }
-        if (event.status === 'readRequested' && event.address) {
+        if (event.status === 'readRequested' && event.address && typeof event.requestId === 'number') {
           const value = this.base64(new TextEncoder().encode(JSON.stringify(room)));
           bluetooth.respond(() => undefined, () => undefined, {
-            requestId: event.requestId, address: event.address, value,
+            requestId: event.requestId, address: event.address, offset: event.offset ?? 0, value,
           });
         }
-        if (event.status === 'writeRequested' && event.address && event.value) {
+        if (event.status === 'writeRequested' && event.address && event.value && typeof event.requestId === 'number') {
           bluetooth.respond(() => undefined, () => undefined, {
             requestId: event.requestId, address: event.address, value: event.value,
           });
@@ -202,11 +271,14 @@ class BluetoothService {
     await this.initialize();
     bluetooth.startScan((event) => {
       if (event.status !== 'scanResult' || !event.address) return;
-      const services = typeof event.advertisement === 'object' ? event.advertisement.serviceUuids ?? [] : [];
+      const advertisement = typeof event.advertisement === 'string'
+        ? parseAdvertisement(bluetooth.encodedStringToBytes(event.advertisement))
+        : event.advertisement;
+      const services = typeof advertisement === 'object' ? advertisement.serviceUuids ?? [] : [];
       if (!services.some((service) => service.toLowerCase() === GAME_SERVICE_UUID)) return;
       onRoom({
         address: event.address,
-        name: event.name || (typeof event.advertisement === 'object' ? event.advertisement.localName : '') || 'Sala BURRO',
+        name: event.name || (typeof advertisement === 'object' ? advertisement.localName : '') || 'Sala BURRO',
         rssi: event.rssi ?? -100,
         gameId: '',
         code: '',
@@ -246,6 +318,11 @@ class BluetoothService {
         if (!connected) reject(new Error('A conexão com a sala expirou. Tente novamente.'));
       }, 20000);
     });
+    try {
+      await this.call((resolve, reject) => bluetooth.mtu(resolve, reject, { address: room.address, mtu: 256 }));
+    } catch {
+      // Keep the default MTU as a fallback; the host also supports offset reads.
+    }
     await this.call((resolve, reject) => bluetooth.discover(resolve, reject, { address: room.address }));
     await new Promise<void>((resolve, reject) => bluetooth.subscribe((event) => {
       if (event.status === 'subscribed') resolve();
@@ -293,12 +370,7 @@ class BluetoothService {
     if (!recipients.length) throw new Error('Ainda não há jogadores conectados à sala.');
     for (const address of recipients) {
       for (const frame of frames) {
-        await this.call((resolve, reject) => bluetooth.notify(resolve, reject, {
-          service: GAME_SERVICE_UUID,
-          characteristic: GAME_CHARACTERISTIC_UUID,
-          address,
-          value: this.base64(frame),
-        }));
+        await this.notifyPeer(address, frame);
       }
     }
   }
